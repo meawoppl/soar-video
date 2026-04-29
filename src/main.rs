@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::{
     fs,
-    io::AsyncWriteExt,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Semaphore,
     task::{JoinSet, spawn_blocking},
@@ -283,7 +283,7 @@ async fn download_hrieuv174_fits_file(
     let output_path = Path::new(DATA_DIR).join(filename);
 
     if fs::try_exists(&output_path).await? {
-        println!("Skipping existing {}", filename);
+        println!("\nSkipping existing {}", filename);
         return Ok(false);
     }
 
@@ -309,10 +309,29 @@ async fn download_hrieuv174_fits_file(
     Ok(true)
 }
 
-async fn download_hrieuv174_fits_files(
+async fn prompt_retry_failed(failed_count: usize) -> Result<bool, DynError> {
+    print!(
+        "{} downloads failed. Retry failed files? [y/N]: ",
+        failed_count
+    );
+    std::io::stdout().flush()?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(tokio::io::stdin());
+    reader.read_line(&mut line).await?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
+async fn download_hrieuv174_fits_files_pass(
     base_url: &str,
     filenames: &[String],
-) -> Result<(), DynError> {
+    label: &str,
+) -> Result<(usize, usize, Vec<String>), DynError> {
+    if filenames.is_empty() {
+        return Ok((0, 0, Vec::new()));
+    }
+
     fs::create_dir_all(DATA_DIR).await?;
 
     let client = Client::new();
@@ -320,18 +339,16 @@ async fn download_hrieuv174_fits_files(
     let mut join_set = JoinSet::new();
 
     log_step(&format!(
-        "Starting downloads (max {} concurrent connections)...",
-        MAX_CONCURRENT_DOWNLOADS
+        "{} (max {} concurrent connections)...",
+        label, MAX_CONCURRENT_DOWNLOADS
     ));
     log_step(&format!("Total files to download: {}", filenames.len()));
 
-    for (index, filename) in filenames.iter().enumerate() {
+    for filename in filenames.iter() {
         let filename = filename.clone();
         let client = client.clone();
         let semaphore = Arc::clone(&semaphore);
         let base_url = base_url.to_string();
-
-        log_progress("Downloading", index + 1, filenames.len())?;
 
         join_set.spawn(async move {
             let _permit = semaphore
@@ -339,25 +356,58 @@ async fn download_hrieuv174_fits_files(
                 .await
                 .map_err(|error| -> DynError { Box::new(error) })?;
 
-            download_hrieuv174_fits_file(&client, &base_url, &filename).await
+            let result = download_hrieuv174_fits_file(&client, &base_url, &filename).await;
+            Ok::<_, DynError>((filename, result))
         });
     }
 
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
+    let mut completed = 0usize;
+    let mut failed = Vec::new();
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(true)) => downloaded += 1,
-            Ok(Ok(false)) => skipped += 1,
-            Ok(Err(error)) => eprintln!("Download failed: {}", error),
+            Ok(Ok((filename, Ok(true)))) => downloaded += 1,
+            Ok(Ok((filename, Ok(false)))) => skipped += 1,
+            Ok(Ok((filename, Err(error)))) => {
+                failed.push(filename);
+                eprintln!("Download failed: {}", error);
+            }
+            Ok(Err(error)) => eprintln!("Task error: {}", error),
             Err(error) => eprintln!("Task join error: {}", error),
         }
+
+        completed += 1;
+        log_progress("Downloading", completed, filenames.len())?;
     }
 
-    if !filenames.is_empty() {
-        println!();
+    println!();
+    Ok((downloaded, skipped, failed))
+}
+
+async fn download_hrieuv174_fits_files(
+    base_url: &str,
+    filenames: &[String],
+) -> Result<(), DynError> {
+    let (mut downloaded, mut skipped, mut failed) =
+        download_hrieuv174_fits_files_pass(base_url, filenames, "Starting downloads").await?;
+
+    while !failed.is_empty() {
+        log_step(&format!("{} files failed to download.", failed.len()));
+
+        while !prompt_retry_failed(failed.len()).await? {
+            log_step("Retry required to complete all downloads.");
+        }
+
+        let (retry_downloaded, retry_skipped, retry_failed) =
+            download_hrieuv174_fits_files_pass(base_url, &failed, "Retrying failed downloads")
+                .await?;
+        downloaded += retry_downloaded;
+        skipped += retry_skipped;
+        failed = retry_failed;
     }
+
     log_step(&format!(
         "Downloaded {} files, skipped {} existing files",
         downloaded, skipped
