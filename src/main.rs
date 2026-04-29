@@ -22,34 +22,40 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
 type DynError = Box<dyn Error + Send + Sync>;
 
+/// Asinh stretch mapping, derived once from the global percentile range and
+/// applied identically to every frame so that the video has no flicker.
+///
+/// For a pixel value `v`:
+///   normalized = asinh((v - min) / beta) / asinh((max - min) / beta)
+///
+/// `beta` (the "softening" parameter) sets the pivot between linear and
+/// logarithmic behaviour.  Values well below `beta` are mapped linearly,
+/// preserving faint coronal structure; values well above `beta` are mapped
+/// logarithmically, compressing the extreme dynamic range while keeping
+/// bright active-region features visually distinct.
 #[derive(Clone, Copy)]
-struct LogMapping {
+struct AsinhMapping {
     min: f64,
     max: f64,
-    offset: f64,
-    log_min: f64,
-    inv_log_range: f64,
+    beta: f64,
+    inv_asinh_range: f64,
 }
 
-impl LogMapping {
+impl AsinhMapping {
     fn from_range(global_min: f64, global_max: f64) -> Self {
-        let offset = if global_min > 0.0 {
-            0.0
-        } else {
-            global_min.abs() + 1.0
-        };
+        let range = (global_max - global_min).max(f64::EPSILON);
+        // 2 % of the full range: faint features stay linear while bright
+        // structures are gently compressed rather than crushed.
+        let beta = 0.02 * range;
+        let inv_asinh_range = ((range / beta).asinh()).max(f64::EPSILON).recip();
+        Self { min: global_min, max: global_max, beta, inv_asinh_range }
+    }
 
-        let log_min = (global_min + offset).ln();
-        let log_max = (global_max + offset).ln();
-        let inv_log_range = (log_max - log_min).max(f64::EPSILON).recip();
-
-        Self {
-            min: global_min,
-            max: global_max,
-            offset,
-            log_min,
-            inv_log_range,
-        }
+    #[inline]
+    fn apply(&self, value: f64) -> f64 {
+        let clamped = value.clamp(self.min, self.max);
+        let shifted = clamped - self.min;
+        ((shifted / self.beta).asinh() * self.inv_asinh_range).clamp(0.0, 1.0)
     }
 }
 
@@ -86,13 +92,16 @@ fn extract_hrieuv174_fits_files(html: &str) -> Vec<String> {
             let href_end = line[href_start..].find('"')? + href_start;
             let filename = &line[href_start..href_end];
 
-            if filename.contains("hrieuv174") && filename.ends_with(".fits") {
+            if filename.contains("hrieuv174")
+                && filename.ends_with(".fits")
+                && !filename.contains("short")
+            {
                 Some(filename.to_string())
             } else {
                 None
             }
-    })
-    .collect()
+        })
+        .collect()
 }
 
 fn processing_concurrency() -> usize {
@@ -124,18 +133,16 @@ fn compute_frame_percentiles(
     let high_index = percentile_index(pixels.len(), p_high);
 
     let low = {
-        let (_, value, _) = pixels.select_nth_unstable_by(low_index, |a, b| {
-            a.partial_cmp(b).unwrap()
-        });
+        let (_, value, _) =
+            pixels.select_nth_unstable_by(low_index, |a, b| a.partial_cmp(b).unwrap());
         *value as f64
     };
 
     let high = if high_index == low_index {
         low
     } else {
-        let (_, value, _) = pixels.select_nth_unstable_by(high_index, |a, b| {
-            a.partial_cmp(b).unwrap()
-        });
+        let (_, value, _) =
+            pixels.select_nth_unstable_by(high_index, |a, b| a.partial_cmp(b).unwrap());
         *value as f64
     };
 
@@ -260,7 +267,8 @@ async fn generate_video_from_fits_files(
     let (global_min, global_max) = compute_global_range(filenames, 1.0, 99.0).await?;
     println!("Global range: {} to {}", global_min, global_max);
 
-    let mapping = LogMapping::from_range(global_min, global_max);
+    let mapping = AsinhMapping::from_range(global_min, global_max);
+    println!("Asinh beta: {:.4} (softening = 2 % of range)", mapping.beta);
 
     println!("Converting FITS files to PNG frames...");
     convert_fits_files_to_png_frames(filenames, &frame_dir, mapping).await?;
@@ -379,7 +387,7 @@ async fn compute_global_range(
 async fn convert_fits_files_to_png_frames(
     filenames: &[String],
     frame_dir: &Path,
-    mapping: LogMapping,
+    mapping: AsinhMapping,
 ) -> Result<(), DynError> {
     let concurrency = processing_concurrency();
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -442,7 +450,7 @@ async fn convert_fits_files_to_png_frames(
 fn fits_to_png_frame(
     fits_path: &Path,
     png_path: &Path,
-    mapping: LogMapping,
+    mapping: AsinhMapping,
 ) -> Result<(), DynError> {
     let mut fits_file = FitsFile::open(fits_path)?;
     let (hdu_index, shape) = find_image_hdu(&mut fits_file)?;
@@ -467,10 +475,7 @@ fn fits_to_png_frame(
             if !v.is_finite() {
                 return 0;
             }
-            let clamped = (v as f64).clamp(mapping.min, mapping.max);
-            let shifted = clamped + mapping.offset;
-            let normalized = (shifted.ln() - mapping.log_min) * mapping.inv_log_range;
-            (normalized.clamp(0.0, 1.0) * 255.0).round() as u8
+            (mapping.apply(v as f64) * 255.0).round() as u8
         })
         .collect();
 
