@@ -20,6 +20,12 @@ const BASE_URL: &str = "https://www.sidc.be/EUI/data/L2";
 const DATA_DIR: &str = "data";
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
+/// Number of horizontal / vertical tiles for CLAHE.
+const CLAHE_TILES_X: usize = 8;
+const CLAHE_TILES_Y: usize = 8;
+/// Clip limit relative to the average bin occupancy (typical: 2–4).
+const CLAHE_CLIP_LIMIT: f64 = 3.0;
+
 type DynError = Box<dyn Error + Send + Sync>;
 
 /// Asinh stretch mapping, derived once from the global percentile range and
@@ -56,6 +62,105 @@ impl AsinhMapping {
         let clamped = value.clamp(self.min, self.max);
         let shifted = clamped - self.min;
         ((shifted / self.beta).asinh() * self.inv_asinh_range).clamp(0.0, 1.0)
+    }
+}
+
+/// Per-tile LUTs derived from histograms **stacked across every frame**.
+///
+/// Because the same LUTs are applied to all frames the mapping is
+/// frame-independent, so the video has no flicker.  Within each frame the
+/// four surrounding tile LUTs are bilinearly interpolated per pixel, which
+/// gives the local contrast benefit of adaptive histogram equalization.
+struct ClaheLut {
+    /// Flattened `[tiles_y * tiles_x]` array; each entry maps bin → output u8.
+    luts: Vec<[u8; 256]>,
+    tiles_x: usize,
+    tiles_y: usize,
+    width: u32,
+    height: u32,
+}
+
+impl ClaheLut {
+    /// Build LUTs from a stacked histogram (sum over all frames).
+    fn build(
+        stacked: &[Vec<u64>],
+        tiles_x: usize,
+        tiles_y: usize,
+        width: u32,
+        height: u32,
+        clip_limit: f64,
+    ) -> Self {
+        let num_tiles = tiles_x * tiles_y;
+        let mut luts: Vec<[u8; 256]> = vec![[0u8; 256]; num_tiles];
+
+        for (hist, lut) in stacked.iter().zip(luts.iter_mut()) {
+            let total: u64 = hist.iter().sum();
+            if total == 0 {
+                for (i, v) in lut.iter_mut().enumerate() {
+                    *v = i as u8;
+                }
+                continue;
+            }
+
+            // Clip and redistribute excess uniformly.
+            let clip_abs = ((clip_limit * total as f64) / 256.0).ceil() as u64;
+            let mut clipped = hist.to_vec();
+            let mut excess = 0u64;
+            for bin in clipped.iter_mut() {
+                if *bin > clip_abs {
+                    excess += *bin - clip_abs;
+                    *bin = clip_abs;
+                }
+            }
+            let add_per_bin = excess / 256;
+            let remainder = (excess % 256) as usize;
+            for bin in clipped.iter_mut() {
+                *bin += add_per_bin;
+            }
+            for bin in clipped.iter_mut().take(remainder) {
+                *bin += 1;
+            }
+
+            // CDF → normalised LUT.
+            let cdf_total: u64 = clipped.iter().sum();
+            let mut cdf = 0u64;
+            for (&count, out) in clipped.iter().zip(lut.iter_mut()) {
+                cdf += count;
+                *out = ((cdf as f64 / cdf_total as f64) * 255.0).round() as u8;
+            }
+        }
+
+        ClaheLut { luts, tiles_x, tiles_y, width, height }
+    }
+
+    /// Look up the output value for pixel `(x, y)` whose asinh-normalised
+    /// value maps to `bin` (0–255), using bilinear tile interpolation.
+    #[inline]
+    fn apply(&self, x: u32, y: u32, bin: usize) -> u8 {
+        let tile_w = self.width as f64 / self.tiles_x as f64;
+        let tile_h = self.height as f64 / self.tiles_y as f64;
+
+        // Fractional position in tile-centre space.
+        let fx = (x as f64 - tile_w * 0.5) / tile_w;
+        let fy = (y as f64 - tile_h * 0.5) / tile_h;
+
+        let tx0 = (fx.floor() as isize).clamp(0, self.tiles_x as isize - 1) as usize;
+        let ty0 = (fy.floor() as isize).clamp(0, self.tiles_y as isize - 1) as usize;
+        let tx1 = (tx0 + 1).min(self.tiles_x - 1);
+        let ty1 = (ty0 + 1).min(self.tiles_y - 1);
+        let wx = (fx - tx0 as f64).clamp(0.0, 1.0);
+        let wy = (fy - ty0 as f64).clamp(0.0, 1.0);
+
+        let v00 = self.luts[ty0 * self.tiles_x + tx0][bin] as f64;
+        let v10 = self.luts[ty0 * self.tiles_x + tx1][bin] as f64;
+        let v01 = self.luts[ty1 * self.tiles_x + tx0][bin] as f64;
+        let v11 = self.luts[ty1 * self.tiles_x + tx1][bin] as f64;
+
+        let v = v00 * (1.0 - wx) * (1.0 - wy)
+              + v10 * wx * (1.0 - wy)
+              + v01 * (1.0 - wx) * wy
+              + v11 * wx * wy;
+        v.round() as u8
     }
 }
 
@@ -270,8 +375,12 @@ async fn generate_video_from_fits_files(
     let mapping = AsinhMapping::from_range(global_min, global_max);
     println!("Asinh beta: {:.4} (softening = 2 % of range)", mapping.beta);
 
+    println!("Building fixed CLAHE LUT from stacked histograms...");
+    let clahe = Arc::new(build_clahe_lut(filenames, mapping).await?);
+    println!("CLAHE LUT ready ({} tiles, clip limit {}x)", CLAHE_TILES_X * CLAHE_TILES_Y, CLAHE_CLIP_LIMIT);
+
     println!("Converting FITS files to PNG frames...");
-    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping).await?;
+    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping, clahe).await?;
 
     println!("\nAll frames processed, generating video...");
 
@@ -384,10 +493,138 @@ async fn compute_global_range(
     Ok((median_min, median_max))
 }
 
+/// Read one FITS file and accumulate a per-tile histogram in asinh-normalised
+/// space.  Returns `(width, height, histograms[tile_idx][bin])`.
+fn compute_frame_tile_histograms(
+    fits_path: &Path,
+    mapping: AsinhMapping,
+    tiles_x: usize,
+    tiles_y: usize,
+) -> Result<(u32, u32, Vec<Vec<u64>>), DynError> {
+    let mut fits_file = FitsFile::open(fits_path)?;
+    let (hdu_index, shape) = find_image_hdu(&mut fits_file)?;
+    if shape.len() != 2 {
+        return Err(format!("Expected 2D image, got {:?}", shape).into());
+    }
+    let width = shape[0] as u32;
+    let height = shape[1] as u32;
+    let hdu = fits_file.hdu(hdu_index)?;
+    let pixels: Vec<f32> = hdu.read_image(&mut fits_file)?;
+
+    let num_tiles = tiles_x * tiles_y;
+    let mut histograms: Vec<Vec<u64>> = vec![vec![0u64; 256]; num_tiles];
+    let tile_w = width as f64 / tiles_x as f64;
+    let tile_h = height as f64 / tiles_y as f64;
+    let w = width as usize;
+
+    for (i, &v) in pixels.iter().enumerate() {
+        if !v.is_finite() {
+            continue;
+        }
+        let px = (i % w) as u32;
+        let py = (i / w) as u32;
+        let tx = ((px as f64 / tile_w) as usize).min(tiles_x - 1);
+        let ty = ((py as f64 / tile_h) as usize).min(tiles_y - 1);
+        let bin = (mapping.apply(v as f64) * 255.0).round() as usize;
+        histograms[ty * tiles_x + tx][bin] += 1;
+    }
+
+    Ok((width, height, histograms))
+}
+
+/// Stack per-frame tile histograms across all files and compute one fixed set
+/// of CLAHE LUTs.  Every frame sees the same LUTs → no flicker.
+async fn build_clahe_lut(
+    filenames: &[String],
+    mapping: AsinhMapping,
+) -> Result<ClaheLut, DynError> {
+    let concurrency = processing_concurrency();
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set: JoinSet<Result<(u32, u32, Vec<Vec<u64>>), DynError>> = JoinSet::new();
+
+    println!("Computing stacked tile histograms for CLAHE...");
+    for filename in filenames {
+        let fits_path = Path::new(DATA_DIR).join(filename);
+        let semaphore = Arc::clone(&semaphore);
+
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|e| -> DynError { Box::new(e) })?;
+            spawn_blocking(move || {
+                compute_frame_tile_histograms(
+                    &fits_path,
+                    mapping,
+                    CLAHE_TILES_X,
+                    CLAHE_TILES_Y,
+                )
+            })
+            .await
+            .map_err(|e| -> DynError { Box::new(e) })?
+        });
+    }
+
+    let num_tiles = CLAHE_TILES_X * CLAHE_TILES_Y;
+    let mut stacked: Vec<Vec<u64>> = vec![vec![0u64; 256]; num_tiles];
+    let mut img_width = 0u32;
+    let mut img_height = 0u32;
+    let mut completed = 0usize;
+    let mut first_error: Option<DynError> = None;
+
+    while let Some(result) = join_set.join_next().await {
+        completed += 1;
+        print!("\rHistogram {}/{}", completed, filenames.len());
+        std::io::stdout().flush()?;
+
+        if first_error.is_some() {
+            continue;
+        }
+        match result {
+            Ok(Ok((w, h, hist))) => {
+                img_width = w;
+                img_height = h;
+                for (tile_hist, tile_stacked) in hist.iter().zip(stacked.iter_mut()) {
+                    for (src, dst) in tile_hist.iter().zip(tile_stacked.iter_mut()) {
+                        *dst += src;
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                eprintln!("\nHistogram task failed: {}", error);
+                first_error = Some(error);
+                join_set.abort_all();
+            }
+            Err(error) => {
+                eprintln!("\nHistogram join error: {}", error);
+                first_error = Some(Box::new(error));
+                join_set.abort_all();
+            }
+        }
+    }
+
+    if !filenames.is_empty() {
+        println!();
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    Ok(ClaheLut::build(
+        &stacked,
+        CLAHE_TILES_X,
+        CLAHE_TILES_Y,
+        img_width,
+        img_height,
+        CLAHE_CLIP_LIMIT,
+    ))
+}
+
 async fn convert_fits_files_to_png_frames(
     filenames: &[String],
     frame_dir: &Path,
     mapping: AsinhMapping,
+    clahe: Arc<ClaheLut>,
 ) -> Result<(), DynError> {
     let concurrency = processing_concurrency();
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -397,6 +634,7 @@ async fn convert_fits_files_to_png_frames(
         let fits_path = Path::new(DATA_DIR).join(filename);
         let frame_path = frame_dir.join(format!("frame_{:05}.png", index));
         let semaphore = Arc::clone(&semaphore);
+        let clahe = Arc::clone(&clahe);
 
         join_set.spawn(async move {
             let _permit = semaphore
@@ -404,7 +642,7 @@ async fn convert_fits_files_to_png_frames(
                 .await
                 .map_err(|error| -> DynError { Box::new(error) })?;
 
-            spawn_blocking(move || fits_to_png_frame(&fits_path, &frame_path, mapping))
+            spawn_blocking(move || fits_to_png_frame(&fits_path, &frame_path, mapping, &clahe))
                 .await
                 .map_err(|error| -> DynError { Box::new(error) })?
         });
@@ -451,6 +689,7 @@ fn fits_to_png_frame(
     fits_path: &Path,
     png_path: &Path,
     mapping: AsinhMapping,
+    clahe: &ClaheLut,
 ) -> Result<(), DynError> {
     let mut fits_file = FitsFile::open(fits_path)?;
     let (hdu_index, shape) = find_image_hdu(&mut fits_file)?;
@@ -459,23 +698,24 @@ fn fits_to_png_frame(
         return Err(format!("Expected 2D image, got shape {:?}", shape).into());
     }
 
-    // Verify axis order: FITS NAXIS1 is usually width. If fitsio returns
-    // shape = [NAXIS1, NAXIS2], then width = shape[0], height = shape[1].
-    // Your original code swapped these; if your images are non-square,
-    // they were likely sheared, not just rotated.
     let width = shape[0] as u32;
     let height = shape[1] as u32;
 
     let hdu = fits_file.hdu(hdu_index)?;
     let pixels: Vec<f32> = hdu.read_image(&mut fits_file)?;
+    let w = width as usize;
 
     let bytes: Vec<u8> = pixels
         .into_iter()
-        .map(|v| {
+        .enumerate()
+        .map(|(i, v)| {
             if !v.is_finite() {
                 return 0;
             }
-            (mapping.apply(v as f64) * 255.0).round() as u8
+            let x = (i % w) as u32;
+            let y = (i / w) as u32;
+            let bin = (mapping.apply(v as f64) * 255.0).round() as usize;
+            clahe.apply(x, y, bin)
         })
         .collect();
 
