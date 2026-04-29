@@ -1,6 +1,6 @@
 use clap::Parser;
-use fitsio::{FitsFile, hdu::HduInfo, sys::stdout};
-use image::{GrayImage, io};
+use fitsio::{FitsFile, hdu::HduInfo};
+use image::GrayImage;
 use reqwest::Client;
 use std::{
     error::Error,
@@ -21,6 +21,37 @@ const DATA_DIR: &str = "data";
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
 type DynError = Box<dyn Error + Send + Sync>;
+
+#[derive(Clone, Copy)]
+struct LogMapping {
+    min: f64,
+    max: f64,
+    offset: f64,
+    log_min: f64,
+    inv_log_range: f64,
+}
+
+impl LogMapping {
+    fn from_range(global_min: f64, global_max: f64) -> Self {
+        let offset = if global_min > 0.0 {
+            0.0
+        } else {
+            global_min.abs() + 1.0
+        };
+
+        let log_min = (global_min + offset).ln();
+        let log_max = (global_max + offset).ln();
+        let inv_log_range = (log_max - log_min).max(f64::EPSILON).recip();
+
+        Self {
+            min: global_min,
+            max: global_max,
+            offset,
+            log_min,
+            inv_log_range,
+        }
+    }
+}
 
 #[derive(clap::Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -60,8 +91,55 @@ fn extract_hrieuv174_fits_files(html: &str) -> Vec<String> {
             } else {
                 None
             }
-        })
-        .collect()
+    })
+    .collect()
+}
+
+fn processing_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+}
+
+fn percentile_index(len: usize, percentile: f64) -> usize {
+    (((len - 1) as f64 * percentile / 100.0).round() as usize).clamp(0, len - 1)
+}
+
+fn compute_frame_percentiles(
+    fits_path: &Path,
+    p_low: f64,
+    p_high: f64,
+) -> Result<Option<(f64, f64)>, DynError> {
+    let mut fits_file = FitsFile::open(fits_path)?;
+    let (hdu_index, _) = find_image_hdu(&mut fits_file)?;
+    let hdu = fits_file.hdu(hdu_index)?;
+    let mut pixels: Vec<f32> = hdu.read_image(&mut fits_file)?;
+
+    pixels.retain(|value| value.is_finite());
+    if pixels.is_empty() {
+        return Ok(None);
+    }
+
+    let low_index = percentile_index(pixels.len(), p_low);
+    let high_index = percentile_index(pixels.len(), p_high);
+
+    let low = {
+        let (_, value, _) = pixels.select_nth_unstable_by(low_index, |a, b| {
+            a.partial_cmp(b).unwrap()
+        });
+        *value as f64
+    };
+
+    let high = if high_index == low_index {
+        low
+    } else {
+        let (_, value, _) = pixels.select_nth_unstable_by(high_index, |a, b| {
+            a.partial_cmp(b).unwrap()
+        });
+        *value as f64
+    };
+
+    Ok(Some((low, high)))
 }
 
 async fn download_hrieuv174_fits_file(
@@ -179,27 +257,13 @@ async fn generate_video_from_fits_files(
     fs::create_dir_all(&frame_dir).await?;
 
     println!("Computing global intensity range...");
-    let filenames_for_range = filenames.to_vec();
-    let (global_min, global_max) =
-        spawn_blocking(move || compute_global_range(&filenames_for_range, 1.0, 99.0)).await??;
+    let (global_min, global_max) = compute_global_range(filenames, 1.0, 99.0).await?;
     println!("Global range: {} to {}", global_min, global_max);
 
+    let mapping = LogMapping::from_range(global_min, global_max);
+
     println!("Converting FITS files to PNG frames...");
-    for (index, filename) in filenames.iter().enumerate() {
-        print!(
-            "\rProcessing frame {}/{}: {}",
-            index + 1,
-            filenames.len(),
-            filename
-        );
-        std::io::stdout().flush()?;
-
-        let fits_path = Path::new(DATA_DIR).join(filename);
-        let frame_path = frame_dir.join(format!("frame_{:05}.png", index));
-        let (min, max) = (global_min, global_max);
-
-        spawn_blocking(move || fits_to_png_frame(&fits_path, &frame_path, min, max)).await??;
-    }
+    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping).await?;
 
     println!("\nAll frames processed, generating video...");
 
@@ -225,54 +289,86 @@ async fn generate_video_from_fits_files(
     Ok(())
 }
 
-fn compute_global_range(
+async fn compute_global_range(
     filenames: &[String],
     p_low: f64,
     p_high: f64,
 ) -> Result<(f64, f64), DynError> {
+    let concurrency = processing_concurrency();
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
     let mut lows = Vec::with_capacity(filenames.len());
     let mut highs = Vec::with_capacity(filenames.len());
 
     println!("Computing per-frame intensity percentiles...");
-    for (index, filename) in filenames.iter().enumerate() {
-        print!(
-            "\rProcessing {}/{}: {}",
-            index + 1,
-            filenames.len(),
-            filename
-        );
-        let path = Path::new(DATA_DIR).join(filename);
-        let mut file = FitsFile::open(&path)?;
-        let (hdu_index, _) = find_image_hdu(&mut file)?;
-        let hdu = file.hdu(hdu_index)?;
-        let pixels: Vec<f32> = hdu.read_image(&mut file)?;
+    for filename in filenames {
+        let fits_path = Path::new(DATA_DIR).join(filename);
+        let semaphore = Arc::clone(&semaphore);
 
-        let mut finite: Vec<f32> = pixels
-            .into_iter()
-            .filter(|value| value.is_finite())
-            .collect();
-        if finite.is_empty() {
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|error| -> DynError { Box::new(error) })?;
+
+            spawn_blocking(move || compute_frame_percentiles(&fits_path, p_low, p_high))
+                .await
+                .map_err(|error| -> DynError { Box::new(error) })?
+        });
+    }
+
+    let mut completed = 0usize;
+    let mut first_error: Option<DynError> = None;
+    while let Some(result) = join_set.join_next().await {
+        completed += 1;
+        print!("\rProcessing {}/{}", completed, filenames.len());
+        std::io::stdout().flush()?;
+
+        if first_error.is_some() {
             continue;
         }
-        finite.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let n = finite.len();
-        let idx_low = ((n - 1) as f64 * p_low / 100.0).round() as usize;
-        let idx_high = ((n - 1) as f64 * p_high / 100.0).round() as usize;
+        match result {
+            Ok(Ok(Some((low, high)))) => {
+                lows.push(low);
+                highs.push(high);
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                eprintln!("Percentile task failed: {}", error);
+                first_error = Some(error);
+                join_set.abort_all();
+            }
+            Err(error) => {
+                eprintln!("Percentile task join error: {}", error);
+                first_error = Some(Box::new(error));
+                join_set.abort_all();
+            }
+        }
+    }
 
-        lows.push(finite[idx_low.clamp(0, n - 1)] as f64);
-        highs.push(finite[idx_high.clamp(0, n - 1)] as f64);
+    if !filenames.is_empty() {
+        println!();
     }
 
     if lows.is_empty() {
         return Ok((0.0, 1.0));
     }
 
-    lows.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    highs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if let Some(error) = first_error {
+        return Err(error);
+    }
 
-    let median_min = lows[lows.len() / 2];
-    let median_max = highs[highs.len() / 2];
+    let median_min = {
+        let mid = lows.len() / 2;
+        let (_, value, _) = lows.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+        *value
+    };
+    let median_max = {
+        let mid = highs.len() / 2;
+        let (_, value, _) = highs.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+        *value
+    };
     println!(
         "\nMedian 1st percentile: {}, Median 99th percentile: {}",
         median_min, median_max
@@ -280,11 +376,73 @@ fn compute_global_range(
     Ok((median_min, median_max))
 }
 
+async fn convert_fits_files_to_png_frames(
+    filenames: &[String],
+    frame_dir: &Path,
+    mapping: LogMapping,
+) -> Result<(), DynError> {
+    let concurrency = processing_concurrency();
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
+
+    for (index, filename) in filenames.iter().enumerate() {
+        let fits_path = Path::new(DATA_DIR).join(filename);
+        let frame_path = frame_dir.join(format!("frame_{:05}.png", index));
+        let semaphore = Arc::clone(&semaphore);
+
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|error| -> DynError { Box::new(error) })?;
+
+            spawn_blocking(move || fits_to_png_frame(&fits_path, &frame_path, mapping))
+                .await
+                .map_err(|error| -> DynError { Box::new(error) })?
+        });
+    }
+
+    let mut completed = 0usize;
+    let mut first_error: Option<DynError> = None;
+    while let Some(result) = join_set.join_next().await {
+        completed += 1;
+        print!("\rProcessing frame {}/{}", completed, filenames.len());
+        std::io::stdout().flush()?;
+
+        if first_error.is_some() {
+            continue;
+        }
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("Frame conversion failed: {}", error);
+                first_error = Some(error);
+                join_set.abort_all();
+            }
+            Err(error) => {
+                eprintln!("Frame task join error: {}", error);
+                first_error = Some(Box::new(error));
+                join_set.abort_all();
+            }
+        }
+    }
+
+    if !filenames.is_empty() {
+        println!();
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    Ok(())
+}
+
 fn fits_to_png_frame(
     fits_path: &Path,
     png_path: &Path,
-    global_min: f64,
-    global_max: f64,
+    mapping: LogMapping,
 ) -> Result<(), DynError> {
     let mut fits_file = FitsFile::open(fits_path)?;
     let (hdu_index, shape) = find_image_hdu(&mut fits_file)?;
@@ -303,26 +461,15 @@ fn fits_to_png_frame(
     let hdu = fits_file.hdu(hdu_index)?;
     let pixels: Vec<f32> = hdu.read_image(&mut fits_file)?;
 
-    let offset = if global_min > 0.0 {
-        0.0
-    } else {
-        global_min.abs() + 1.0
-    };
-
-    let log_min = (global_min + offset).ln();
-    let log_max = (global_max + offset).ln();
-    let log_range = (log_max - log_min).max(f64::EPSILON);
-
     let bytes: Vec<u8> = pixels
         .into_iter()
         .map(|v| {
             if !v.is_finite() {
                 return 0;
             }
-            let v = (v as f64).clamp(global_min, global_max);
-            let shifted = v + offset;
-            let log_val = shifted.ln();
-            let normalized = (log_val - log_min) / log_range;
+            let clamped = (v as f64).clamp(mapping.min, mapping.max);
+            let shifted = clamped + mapping.offset;
+            let normalized = (shifted.ln() - mapping.log_min) * mapping.inv_log_range;
             (normalized.clamp(0.0, 1.0) * 255.0).round() as u8
         })
         .collect();
