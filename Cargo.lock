@@ -335,6 +335,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14929d0b6fa44a87b374a138ea2256c02c1b5beae1dbc98f62a3e132f862fed1"
 dependencies = [
  "autotools",
+ "cmake",
  "pkg-config",
 ]
 
