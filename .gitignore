@@ -1,0 +1,6 @@
+/target
+
+/data
+
+# all .DS_Store files recursively
+.DS_Store
