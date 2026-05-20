@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::{
     fs,
-    io::AsyncWriteExt,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::Semaphore,
     task::{JoinSet, spawn_blocking},
@@ -27,6 +27,16 @@ const CLAHE_TILES_Y: usize = 8;
 const CLAHE_CLIP_LIMIT: f64 = 3.0;
 
 type DynError = Box<dyn Error + Send + Sync>;
+
+fn log_step(message: &str) {
+    println!("{message}");
+}
+
+fn log_progress(prefix: &str, current: usize, total: usize) -> Result<(), DynError> {
+    print!("\r{} {}/{}", prefix, current, total);
+    std::io::stdout().flush()?;
+    Ok(())
+}
 
 /// Asinh stretch mapping, derived once from the global percentile range and
 /// applied identically to every frame so that the video has no flicker.
@@ -54,7 +64,12 @@ impl AsinhMapping {
         // structures are gently compressed rather than crushed.
         let beta = 0.02 * range;
         let inv_asinh_range = ((range / beta).asinh()).max(f64::EPSILON).recip();
-        Self { min: global_min, max: global_max, beta, inv_asinh_range }
+        Self {
+            min: global_min,
+            max: global_max,
+            beta,
+            inv_asinh_range,
+        }
     }
 
     #[inline]
@@ -130,7 +145,13 @@ impl ClaheLut {
             }
         }
 
-        ClaheLut { luts, tiles_x, tiles_y, width, height }
+        ClaheLut {
+            luts,
+            tiles_x,
+            tiles_y,
+            width,
+            height,
+        }
     }
 
     /// Look up the output value for pixel `(x, y)` whose asinh-normalised
@@ -157,9 +178,9 @@ impl ClaheLut {
         let v11 = self.luts[ty1 * self.tiles_x + tx1][bin] as f64;
 
         let v = v00 * (1.0 - wx) * (1.0 - wy)
-              + v10 * wx * (1.0 - wy)
-              + v01 * (1.0 - wx) * wy
-              + v11 * wx * wy;
+            + v10 * wx * (1.0 - wy)
+            + v01 * (1.0 - wx) * wy
+            + v11 * wx * wy;
         v.round() as u8
     }
 }
@@ -266,7 +287,7 @@ async fn download_hrieuv174_fits_file(
     let output_path = Path::new(DATA_DIR).join(filename);
 
     if fs::try_exists(&output_path).await? {
-        println!("Skipping existing {}", filename);
+        println!("\nSkipping existing {}", filename);
         return Ok(false);
     }
 
@@ -289,21 +310,45 @@ async fn download_hrieuv174_fits_file(
     file.flush().await?;
     fs::rename(&temp_path, &output_path).await?;
 
-    println!("Downloaded {}", filename);
     Ok(true)
 }
 
-async fn download_hrieuv174_fits_files(
+async fn prompt_retry_failed(failed_count: usize) -> Result<bool, DynError> {
+    print!(
+        "{} downloads failed. Retry failed files? [y/N]: ",
+        failed_count
+    );
+    std::io::stdout().flush()?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(tokio::io::stdin());
+    reader.read_line(&mut line).await?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
+async fn download_hrieuv174_fits_files_pass(
     base_url: &str,
     filenames: &[String],
-) -> Result<(), DynError> {
+    label: &str,
+) -> Result<(usize, usize, Vec<String>), DynError> {
+    if filenames.is_empty() {
+        return Ok((0, 0, Vec::new()));
+    }
+
     fs::create_dir_all(DATA_DIR).await?;
 
     let client = Client::new();
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
     let mut join_set = JoinSet::new();
 
-    for filename in filenames {
+    log_step(&format!(
+        "{} (max {} concurrent connections)...",
+        label, MAX_CONCURRENT_DOWNLOADS
+    ));
+    log_step(&format!("Total files to download: {}", filenames.len()));
+
+    for filename in filenames.iter() {
         let filename = filename.clone();
         let client = client.clone();
         let semaphore = Arc::clone(&semaphore);
@@ -315,26 +360,62 @@ async fn download_hrieuv174_fits_files(
                 .await
                 .map_err(|error| -> DynError { Box::new(error) })?;
 
-            download_hrieuv174_fits_file(&client, &base_url, &filename).await
+            let result = download_hrieuv174_fits_file(&client, &base_url, &filename).await;
+            Ok::<_, DynError>((filename, result))
         });
     }
 
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
+    let mut completed = 0usize;
+    let mut failed = Vec::new();
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(true)) => downloaded += 1,
-            Ok(Ok(false)) => skipped += 1,
-            Ok(Err(error)) => eprintln!("Download failed: {}", error),
+            Ok(Ok((filename, Ok(true)))) => downloaded += 1,
+            Ok(Ok((filename, Ok(false)))) => skipped += 1,
+            Ok(Ok((filename, Err(error)))) => {
+                failed.push(filename);
+                eprintln!("Download failed: {}", error);
+            }
+            Ok(Err(error)) => eprintln!("Task error: {}", error),
             Err(error) => eprintln!("Task join error: {}", error),
         }
+
+        completed += 1;
+        log_progress("Downloading", completed, filenames.len())?;
     }
 
-    println!(
+    println!();
+    Ok((downloaded, skipped, failed))
+}
+
+async fn download_hrieuv174_fits_files(
+    base_url: &str,
+    filenames: &[String],
+) -> Result<(), DynError> {
+    let (mut downloaded, mut skipped, mut failed) =
+        download_hrieuv174_fits_files_pass(base_url, filenames, "Starting downloads").await?;
+
+    while !failed.is_empty() {
+        log_step(&format!("{} files failed to download.", failed.len()));
+
+        while !prompt_retry_failed(failed.len()).await? {
+            log_step("Retry required to complete all downloads.");
+        }
+
+        let (retry_downloaded, retry_skipped, retry_failed) =
+            download_hrieuv174_fits_files_pass(base_url, &failed, "Retrying failed downloads")
+                .await?;
+        downloaded += retry_downloaded;
+        skipped += retry_skipped;
+        failed = retry_failed;
+    }
+
+    log_step(&format!(
         "Downloaded {} files, skipped {} existing files",
         downloaded, skipped
-    );
+    ));
 
     Ok(())
 }
@@ -350,7 +431,11 @@ async fn ensure_all_files_are_present(filenames: &[String]) -> Result<(), DynErr
     }
 
     if missing_files.is_empty() {
-        println!("Verified {} FITS files in {}", filenames.len(), DATA_DIR);
+        log_step(&format!(
+            "Verified {} FITS files in {}",
+            filenames.len(),
+            DATA_DIR
+        ));
         Ok(())
     } else {
         Err(format!(
@@ -434,16 +519,23 @@ async fn generate_video_from_fits_files(
     }
     fs::create_dir_all(&frame_dir).await?;
 
-    println!("Computing global intensity range...");
+    log_step("Computing global intensity range...");
     let (global_min, global_max) = compute_global_range(filenames, 1.0, 99.0).await?;
-    println!("Global range: {} to {}", global_min, global_max);
+    log_step(&format!("Global range: {} to {}", global_min, global_max));
 
     let mapping = AsinhMapping::from_range(global_min, global_max);
-    println!("Asinh beta: {:.4} (softening = 2 % of range)", mapping.beta);
+    log_step(&format!(
+        "Asinh beta: {:.4} (softening = 2 % of range)",
+        mapping.beta
+    ));
 
-    println!("Building fixed CLAHE LUT from stacked histograms...");
+    log_step("Building fixed CLAHE LUT from stacked histograms...");
     let clahe = Arc::new(build_clahe_lut(filenames, mapping).await?);
-    println!("CLAHE LUT ready ({} tiles, clip limit {}x)", CLAHE_TILES_X * CLAHE_TILES_Y, CLAHE_CLIP_LIMIT);
+    log_step(&format!(
+        "CLAHE LUT ready ({} tiles, clip limit {}x)",
+        CLAHE_TILES_X * CLAHE_TILES_Y,
+        CLAHE_CLIP_LIMIT
+    ));
 
     if let Some(s) = unsharp_strength {
         println!("Unsharp masking enabled (strength {s:.2}, sigma 2.0 px)");
@@ -451,7 +543,7 @@ async fn generate_video_from_fits_files(
     println!("Converting FITS files to PNG frames...");
     convert_fits_files_to_png_frames(filenames, &frame_dir, mapping, clahe, unsharp_strength).await?;
 
-    println!("\nAll frames processed, generating video...");
+    log_step("All frames processed, generating video...");
 
     let status = Command::new("ffmpeg")
         .arg("-y")
@@ -471,7 +563,7 @@ async fn generate_video_from_fits_files(
         return Err(format!("ffmpeg failed for {}", output_path.display()).into());
     }
 
-    println!("Generated video at {}", output_path.display());
+    log_step(&format!("Generated video at {}", output_path.display()));
     Ok(())
 }
 
@@ -486,7 +578,7 @@ async fn compute_global_range(
     let mut lows = Vec::with_capacity(filenames.len());
     let mut highs = Vec::with_capacity(filenames.len());
 
-    println!("Computing per-frame intensity percentiles...");
+    log_step("Computing per-frame intensity percentiles...");
     for filename in filenames {
         let fits_path = Path::new(DATA_DIR).join(filename);
         let semaphore = Arc::clone(&semaphore);
@@ -507,8 +599,7 @@ async fn compute_global_range(
     let mut first_error: Option<DynError> = None;
     while let Some(result) = join_set.join_next().await {
         completed += 1;
-        print!("\rProcessing {}/{}", completed, filenames.len());
-        std::io::stdout().flush()?;
+        log_progress("Processing", completed, filenames.len())?;
 
         if first_error.is_some() {
             continue;
@@ -555,10 +646,10 @@ async fn compute_global_range(
         let (_, value, _) = highs.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
         *value
     };
-    println!(
-        "\nMedian 1st percentile: {}, Median 99th percentile: {}",
+    log_step(&format!(
+        "Median 1st percentile: {}, Median 99th percentile: {}",
         median_min, median_max
-    );
+    ));
     Ok((median_min, median_max))
 }
 
@@ -611,7 +702,7 @@ async fn build_clahe_lut(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut join_set: JoinSet<Result<(u32, u32, Vec<Vec<u64>>), DynError>> = JoinSet::new();
 
-    println!("Computing stacked tile histograms for CLAHE...");
+    log_step("Computing stacked tile histograms for CLAHE...");
     for filename in filenames {
         let fits_path = Path::new(DATA_DIR).join(filename);
         let semaphore = Arc::clone(&semaphore);
@@ -622,12 +713,7 @@ async fn build_clahe_lut(
                 .await
                 .map_err(|e| -> DynError { Box::new(e) })?;
             spawn_blocking(move || {
-                compute_frame_tile_histograms(
-                    &fits_path,
-                    mapping,
-                    CLAHE_TILES_X,
-                    CLAHE_TILES_Y,
-                )
+                compute_frame_tile_histograms(&fits_path, mapping, CLAHE_TILES_X, CLAHE_TILES_Y)
             })
             .await
             .map_err(|e| -> DynError { Box::new(e) })?
@@ -643,8 +729,7 @@ async fn build_clahe_lut(
 
     while let Some(result) = join_set.join_next().await {
         completed += 1;
-        print!("\rHistogram {}/{}", completed, filenames.len());
-        std::io::stdout().flush()?;
+        log_progress("Histogram", completed, filenames.len())?;
 
         if first_error.is_some() {
             continue;
@@ -722,8 +807,7 @@ async fn convert_fits_files_to_png_frames(
     let mut first_error: Option<DynError> = None;
     while let Some(result) = join_set.join_next().await {
         completed += 1;
-        print!("\rProcessing frame {}/{}", completed, filenames.len());
-        std::io::stdout().flush()?;
+        log_progress("Processing frame", completed, filenames.len())?;
 
         if first_error.is_some() {
             continue;

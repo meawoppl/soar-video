@@ -4,3 +4,5 @@
 
 # all .DS_Store files recursively
 .DS_Store
+
+*.mp4
