@@ -426,7 +426,7 @@ async fn ensure_all_files_are_present(filenames: &[String]) -> Result<(), DynErr
     for filename in filenames {
         let output_path = Path::new(DATA_DIR).join(filename);
         if !fs::try_exists(&output_path).await? {
-            missing_files.push(filename.clone()
+            missing_files.push(filename.clone())
         }
     }
 
@@ -474,7 +474,8 @@ fn gaussian_blur(src: &[u8], width: u32, height: u32, sigma: f32) -> Vec<u8> {
         for x in 0..w {
             let mut acc = 0.0f32;
             for (ki, &kv) in kernel.iter().enumerate() {
-                let sx = (x as isize + ki as isize - radius as isize).clamp(0, w as isize - 1) as usize;
+                let sx =
+                    (x as isize + ki as isize - radius as isize).clamp(0, w as isize - 1) as usize;
                 acc += src[y * w + sx] as f32 * kv;
             }
             tmp[y * w + x] = acc;
@@ -487,7 +488,8 @@ fn gaussian_blur(src: &[u8], width: u32, height: u32, sigma: f32) -> Vec<u8> {
         for x in 0..w {
             let mut acc = 0.0f32;
             for (ki, &kv) in kernel.iter().enumerate() {
-                let sy = (y as isize + ki as isize - radius as isize).clamp(0, h as isize - 1) as usize;
+                let sy =
+                    (y as isize + ki as isize - radius as isize).clamp(0, h as isize - 1) as usize;
                 acc += tmp[sy * w + x] * kv;
             }
             out[y * w + x] = acc.round().clamp(0.0, 255.0) as u8;
@@ -541,7 +543,8 @@ async fn generate_video_from_fits_files(
         println!("Unsharp masking enabled (strength {s:.2}, sigma 2.0 px)");
     }
     println!("Converting FITS files to PNG frames...");
-    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping, clahe, unsharp_strength).await?;
+    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping, clahe, unsharp_strength)
+        .await?;
 
     log_step("All frames processed, generating video...");
 
@@ -797,9 +800,11 @@ async fn convert_fits_files_to_png_frames(
                 .await
                 .map_err(|error| -> DynError { Box::new(error) })?;
 
-            spawn_blocking(move || fits_to_png_frame(&fits_path, &frame_path, mapping, &clahe, unsharp_strength))
-                .await
-                .map_err(|error| -> DynError { Box::new(error) })?
+            spawn_blocking(move || {
+                fits_to_png_frame(&fits_path, &frame_path, mapping, &clahe, unsharp_strength)
+            })
+            .await
+            .map_err(|error| -> DynError { Box::new(error) })?
         });
     }
 
@@ -931,7 +936,8 @@ async fn main() {
                         let video_path = PathBuf::from(DATA_DIR).join(video_name);
 
                         if let Err(error) =
-                            generate_video_from_fits_files(&fits_files, &video_path, args.unsharp).await
+                            generate_video_from_fits_files(&fits_files, &video_path, args.unsharp)
+                                .await
                         {
                             eprintln!("Error generating video: {}", error);
                         }
