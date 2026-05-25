@@ -3,9 +3,10 @@ use fitsio::{FitsFile, hdu::HduInfo};
 use image::GrayImage;
 use reqwest::Client;
 use std::{
+    collections::BTreeMap,
     error::Error,
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 use tokio::{
@@ -16,14 +17,12 @@ use tokio::{
     task::{JoinSet, spawn_blocking},
 };
 
-const BASE_URL: &str = "https://www.sidc.be/EUI/data/L2";
+const BASE_URL: &str = "https://www.sidc.be/EUI/data/L1";
 const DATA_DIR: &str = "data";
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
-/// Number of horizontal / vertical tiles for CLAHE.
 const CLAHE_TILES_X: usize = 8;
 const CLAHE_TILES_Y: usize = 8;
-/// Clip limit relative to the average bin occupancy (typical: 2–4).
 const CLAHE_CLIP_LIMIT: f64 = 3.0;
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -38,17 +37,6 @@ fn log_progress(prefix: &str, current: usize, total: usize) -> Result<(), DynErr
     Ok(())
 }
 
-/// Asinh stretch mapping, derived once from the global percentile range and
-/// applied identically to every frame so that the video has no flicker.
-///
-/// For a pixel value `v`:
-///   normalized = asinh((v - min) / beta) / asinh((max - min) / beta)
-///
-/// `beta` (the "softening" parameter) sets the pivot between linear and
-/// logarithmic behaviour.  Values well below `beta` are mapped linearly,
-/// preserving faint coronal structure; values well above `beta` are mapped
-/// logarithmically, compressing the extreme dynamic range while keeping
-/// bright active-region features visually distinct.
 #[derive(Clone, Copy)]
 struct AsinhMapping {
     min: f64,
@@ -60,8 +48,6 @@ struct AsinhMapping {
 impl AsinhMapping {
     fn from_range(global_min: f64, global_max: f64) -> Self {
         let range = (global_max - global_min).max(f64::EPSILON);
-        // 2 % of the full range: faint features stay linear while bright
-        // structures are gently compressed rather than crushed.
         let beta = 0.02 * range;
         let inv_asinh_range = ((range / beta).asinh()).max(f64::EPSILON).recip();
         Self {
@@ -80,14 +66,7 @@ impl AsinhMapping {
     }
 }
 
-/// Per-tile LUTs derived from histograms **stacked across every frame**.
-///
-/// Because the same LUTs are applied to all frames the mapping is
-/// frame-independent, so the video has no flicker.  Within each frame the
-/// four surrounding tile LUTs are bilinearly interpolated per pixel, which
-/// gives the local contrast benefit of adaptive histogram equalization.
 struct ClaheLut {
-    /// Flattened `[tiles_y * tiles_x]` array; each entry maps bin → output u8.
     luts: Vec<[u8; 256]>,
     tiles_x: usize,
     tiles_y: usize,
@@ -96,7 +75,6 @@ struct ClaheLut {
 }
 
 impl ClaheLut {
-    /// Build LUTs from a stacked histogram (sum over all frames).
     fn build(
         stacked: &[Vec<u64>],
         tiles_x: usize,
@@ -117,7 +95,6 @@ impl ClaheLut {
                 continue;
             }
 
-            // Clip and redistribute excess uniformly.
             let clip_abs = ((clip_limit * total as f64) / 256.0).ceil() as u64;
             let mut clipped = hist.to_vec();
             let mut excess = 0u64;
@@ -136,7 +113,6 @@ impl ClaheLut {
                 *bin += 1;
             }
 
-            // CDF → normalised LUT.
             let cdf_total: u64 = clipped.iter().sum();
             let mut cdf = 0u64;
             for (&count, out) in clipped.iter().zip(lut.iter_mut()) {
@@ -154,14 +130,11 @@ impl ClaheLut {
         }
     }
 
-    /// Look up the output value for pixel `(x, y)` whose asinh-normalised
-    /// value maps to `bin` (0–255), using bilinear tile interpolation.
     #[inline]
     fn apply(&self, x: u32, y: u32, bin: usize) -> u8 {
         let tile_w = self.width as f64 / self.tiles_x as f64;
         let tile_h = self.height as f64 / self.tiles_y as f64;
 
-        // Fractional position in tile-centre space.
         let fx = (x as f64 - tile_w * 0.5) / tile_w;
         let fy = (y as f64 - tile_h * 0.5) / tile_h;
 
@@ -188,46 +161,76 @@ impl ClaheLut {
 #[derive(clap::Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Day
     #[arg(short, long)]
     day: u8,
-    /// Month
     #[arg(short, long)]
     month: u8,
-    /// Year
     #[arg(short, long)]
     year: u16,
+    #[arg(short = 'b', long, default_value = BASE_URL)]
+    base_url: String,
 }
 
-fn find_image_hdu(file: &mut FitsFile) -> Result<(usize, Vec<usize>), DynError> {
-    for hdu_index in 0..file.num_hdus()? {
-        let hdu = file.hdu(hdu_index)?;
-        if let HduInfo::ImageInfo { shape, .. } = &hdu.info {
-            if !shape.is_empty() {
-                return Ok((hdu_index, shape.clone()));
-            }
+fn strip_timestamp_version(filename: &str) -> &str {
+    let s = filename.strip_suffix(".fits").unwrap_or(filename);
+    let s = if let Some(pos) = s.rfind("_V") {
+        if s[pos + 2..].chars().all(|c| c.is_ascii_digit()) {
+            &s[..pos]
+        } else {
+            s
         }
+    } else {
+        s
+    };
+    if let Some(pos) = s.rfind('_') {
+        let candidate = &s[pos + 1..];
+        if candidate.len() >= 9
+            && candidate[..8].chars().all(|c| c.is_ascii_digit())
+            && candidate.as_bytes()[8] == b'T'
+        {
+            &s[..pos]
+        } else {
+            s
+        }
+    } else {
+        s
     }
-    Err("No image HDU found".into())
 }
 
-fn extract_hrieuv174_fits_files(html: &str) -> Vec<String> {
+fn extract_fits_files(html: &str) -> Vec<String> {
     html.lines()
         .filter_map(|line| {
             let href_start = line.find("href=\"")? + "href=\"".len();
             let href_end = line[href_start..].find('"')? + href_start;
             let filename = &line[href_start..href_end];
-
-            if filename.contains("hrieuv174")
-                && filename.ends_with(".fits")
-                && !filename.contains("short")
-            {
+            if filename.ends_with(".fits") {
                 Some(filename.to_string())
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn group_fits_files(files: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in files {
+        let group = strip_timestamp_version(file).to_string();
+        groups.entry(group).or_default().push(file.clone());
+    }
+    groups.into_iter().collect()
+}
+
+fn find_image_hdu(file: &mut FitsFile) -> Result<(usize, Vec<usize>), DynError> {
+    for hdu_index in 0..file.num_hdus()? {
+        let hdu = file.hdu(hdu_index)?;
+        if let HduInfo::ImageInfo { shape, .. } = &hdu.info
+            && !shape.is_empty()
+        {
+            return Ok((hdu_index, shape.clone()));
+        }
+    }
+    Err("No image HDU found".into())
 }
 
 fn processing_concurrency() -> usize {
@@ -275,12 +278,13 @@ fn compute_frame_percentiles(
     Ok(Some((low, high)))
 }
 
-async fn download_hrieuv174_fits_file(
+async fn download_fits_file(
     client: &Client,
     base_url: &str,
     filename: &str,
+    data_dir: &Path,
 ) -> Result<bool, DynError> {
-    let output_path = Path::new(DATA_DIR).join(filename);
+    let output_path = data_dir.join(filename);
 
     if fs::try_exists(&output_path).await? {
         println!("\nSkipping existing {}", filename);
@@ -288,7 +292,11 @@ async fn download_hrieuv174_fits_file(
     }
 
     let download_url = format!("{}/{}", base_url.trim_end_matches('/'), filename);
-    let temp_path = Path::new(DATA_DIR).join(format!("{}.part", filename));
+    let temp_path = data_dir.join(format!("{}.part", filename));
+
+    if let Some(parent) = temp_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
 
     let response = client.get(&download_url).send().await?;
     if !response.status().is_success() {
@@ -323,17 +331,17 @@ async fn prompt_retry_failed(failed_count: usize) -> Result<bool, DynError> {
     Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
-async fn download_hrieuv174_fits_files_pass(
+async fn download_fits_files_pass(
     base_url: &str,
     filenames: &[String],
     label: &str,
+    data_dir: &Path,
 ) -> Result<(usize, usize, Vec<String>), DynError> {
     if filenames.is_empty() {
         return Ok((0, 0, Vec::new()));
     }
 
-    fs::create_dir_all(DATA_DIR).await?;
-
+    let data_dir = data_dir.to_path_buf();
     let client = Client::new();
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
     let mut join_set = JoinSet::new();
@@ -349,6 +357,7 @@ async fn download_hrieuv174_fits_files_pass(
         let client = client.clone();
         let semaphore = Arc::clone(&semaphore);
         let base_url = base_url.to_string();
+        let data_dir = data_dir.clone();
 
         join_set.spawn(async move {
             let _permit = semaphore
@@ -356,7 +365,7 @@ async fn download_hrieuv174_fits_files_pass(
                 .await
                 .map_err(|error| -> DynError { Box::new(error) })?;
 
-            let result = download_hrieuv174_fits_file(&client, &base_url, &filename).await;
+            let result = download_fits_file(&client, &base_url, &filename, &data_dir).await;
             Ok::<_, DynError>((filename, result))
         });
     }
@@ -368,8 +377,8 @@ async fn download_hrieuv174_fits_files_pass(
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok((filename, Ok(true)))) => downloaded += 1,
-            Ok(Ok((filename, Ok(false)))) => skipped += 1,
+            Ok(Ok((_, Ok(true)))) => downloaded += 1,
+            Ok(Ok((_, Ok(false)))) => skipped += 1,
             Ok(Ok((filename, Err(error)))) => {
                 failed.push(filename);
                 eprintln!("Download failed: {}", error);
@@ -386,12 +395,13 @@ async fn download_hrieuv174_fits_files_pass(
     Ok((downloaded, skipped, failed))
 }
 
-async fn download_hrieuv174_fits_files(
+async fn download_fits_files(
     base_url: &str,
     filenames: &[String],
+    data_dir: &Path,
 ) -> Result<(), DynError> {
     let (mut downloaded, mut skipped, mut failed) =
-        download_hrieuv174_fits_files_pass(base_url, filenames, "Starting downloads").await?;
+        download_fits_files_pass(base_url, filenames, "Starting downloads", data_dir).await?;
 
     while !failed.is_empty() {
         log_step(&format!("{} files failed to download.", failed.len()));
@@ -401,7 +411,7 @@ async fn download_hrieuv174_fits_files(
         }
 
         let (retry_downloaded, retry_skipped, retry_failed) =
-            download_hrieuv174_fits_files_pass(base_url, &failed, "Retrying failed downloads")
+            download_fits_files_pass(base_url, &failed, "Retrying failed downloads", data_dir)
                 .await?;
         downloaded += retry_downloaded;
         skipped += retry_skipped;
@@ -416,11 +426,59 @@ async fn download_hrieuv174_fits_files(
     Ok(())
 }
 
-async fn ensure_all_files_are_present(filenames: &[String]) -> Result<(), DynError> {
+async fn prompt_group_selection(groups: &[(String, Vec<String>)]) -> Result<Vec<usize>, DynError> {
+    println!("\nAvailable datasets:");
+    for (i, (group_name, files)) in groups.iter().enumerate() {
+        println!("  {:3}: {} ({} files)", i + 1, group_name, files.len());
+    }
+    print!("\nSelect dataset(s) to download (e.g. \"1,3\", \"1-3\", or \"all\"): ");
+    std::io::stdout().flush()?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(tokio::io::stdin());
+    reader.read_line(&mut line).await?;
+    let answer = line.trim();
+
+    if answer.eq_ignore_ascii_case("all") {
+        return Ok((0..groups.len()).collect());
+    }
+
+    let mut indices = Vec::new();
+    for part in answer.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            let start: usize = start
+                .trim()
+                .parse()
+                .map_err(|e| format!("Invalid range: {}", e))?;
+            let end: usize = end
+                .trim()
+                .parse()
+                .map_err(|e| format!("Invalid range: {}", e))?;
+            for i in start..=end {
+                if i > 0 && i <= groups.len() {
+                    indices.push(i - 1);
+                }
+            }
+        } else if let Ok(num) = part.parse::<usize>() {
+            if num > 0 && num <= groups.len() {
+                indices.push(num - 1);
+            }
+        }
+    }
+    indices.sort();
+    indices.dedup();
+    Ok(indices)
+}
+
+async fn ensure_all_files_are_present(filenames: &[String], data_dir: &Path) -> Result<(), DynError> {
     let mut missing_files = Vec::new();
 
     for filename in filenames {
-        let output_path = Path::new(DATA_DIR).join(filename);
+        let output_path = data_dir.join(filename);
         if !fs::try_exists(&output_path).await? {
             missing_files.push(filename.clone());
         }
@@ -430,22 +488,24 @@ async fn ensure_all_files_are_present(filenames: &[String]) -> Result<(), DynErr
         log_step(&format!(
             "Verified {} FITS files in {}",
             filenames.len(),
-            DATA_DIR
+            data_dir.display()
         ));
         Ok(())
     } else {
         Err(format!(
             "Missing {} FITS files in {}: {:?}",
             missing_files.len(),
-            DATA_DIR,
+            data_dir.display(),
             missing_files
         )
         .into())
     }
 }
+
 async fn generate_video_from_fits_files(
     filenames: &[String],
     output_path: &Path,
+    data_dir: &Path,
 ) -> Result<(), DynError> {
     let frame_dir = output_path.with_extension("");
     if fs::try_exists(&frame_dir).await? {
@@ -454,7 +514,7 @@ async fn generate_video_from_fits_files(
     fs::create_dir_all(&frame_dir).await?;
 
     log_step("Computing global intensity range...");
-    let (global_min, global_max) = compute_global_range(filenames, 1.0, 99.0).await?;
+    let (global_min, global_max) = compute_global_range(filenames, 1.0, 99.0, data_dir).await?;
     log_step(&format!("Global range: {} to {}", global_min, global_max));
 
     let mapping = AsinhMapping::from_range(global_min, global_max);
@@ -464,7 +524,7 @@ async fn generate_video_from_fits_files(
     ));
 
     log_step("Building fixed CLAHE LUT from stacked histograms...");
-    let clahe = Arc::new(build_clahe_lut(filenames, mapping).await?);
+    let clahe = Arc::new(build_clahe_lut(filenames, mapping, data_dir).await?);
     log_step(&format!(
         "CLAHE LUT ready ({} tiles, clip limit {}x)",
         CLAHE_TILES_X * CLAHE_TILES_Y,
@@ -472,14 +532,14 @@ async fn generate_video_from_fits_files(
     ));
 
     log_step("Converting FITS files to PNG frames...");
-    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping, clahe).await?;
+    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping, clahe, data_dir).await?;
 
     log_step("All frames processed, generating video...");
 
     let status = Command::new("ffmpeg")
         .arg("-y")
         .arg("-framerate")
-        .arg("10")
+        .arg("24")
         .arg("-i")
         .arg(frame_dir.join("frame_%05d.png"))
         .arg("-c:v")
@@ -502,16 +562,18 @@ async fn compute_global_range(
     filenames: &[String],
     p_low: f64,
     p_high: f64,
+    data_dir: &Path,
 ) -> Result<(f64, f64), DynError> {
     let concurrency = processing_concurrency();
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut join_set = JoinSet::new();
     let mut lows = Vec::with_capacity(filenames.len());
     let mut highs = Vec::with_capacity(filenames.len());
+    let data_dir = data_dir.to_path_buf();
 
     log_step("Computing per-frame intensity percentiles...");
     for filename in filenames {
-        let fits_path = Path::new(DATA_DIR).join(filename);
+        let fits_path = data_dir.join(filename);
         let semaphore = Arc::clone(&semaphore);
 
         join_set.spawn(async move {
@@ -584,8 +646,6 @@ async fn compute_global_range(
     Ok((median_min, median_max))
 }
 
-/// Read one FITS file and accumulate a per-tile histogram in asinh-normalised
-/// space.  Returns `(width, height, histograms[tile_idx][bin])`.
 fn compute_frame_tile_histograms(
     fits_path: &Path,
     mapping: AsinhMapping,
@@ -623,19 +683,20 @@ fn compute_frame_tile_histograms(
     Ok((width, height, histograms))
 }
 
-/// Stack per-frame tile histograms across all files and compute one fixed set
-/// of CLAHE LUTs.  Every frame sees the same LUTs → no flicker.
 async fn build_clahe_lut(
     filenames: &[String],
     mapping: AsinhMapping,
+    data_dir: &Path,
 ) -> Result<ClaheLut, DynError> {
     let concurrency = processing_concurrency();
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut join_set: JoinSet<Result<(u32, u32, Vec<Vec<u64>>), DynError>> = JoinSet::new();
+    type TaskResult = Result<(u32, u32, Vec<Vec<u64>>), DynError>;
+    let mut join_set: JoinSet<TaskResult> = JoinSet::new();
+    let data_dir = data_dir.to_path_buf();
 
     log_step("Computing stacked tile histograms for CLAHE...");
     for filename in filenames {
-        let fits_path = Path::new(DATA_DIR).join(filename);
+        let fits_path = data_dir.join(filename);
         let semaphore = Arc::clone(&semaphore);
 
         join_set.spawn(async move {
@@ -710,13 +771,15 @@ async fn convert_fits_files_to_png_frames(
     frame_dir: &Path,
     mapping: AsinhMapping,
     clahe: Arc<ClaheLut>,
+    data_dir: &Path,
 ) -> Result<(), DynError> {
     let concurrency = processing_concurrency();
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut join_set = JoinSet::new();
+    let data_dir = data_dir.to_path_buf();
 
     for (index, filename) in filenames.iter().enumerate() {
-        let fits_path = Path::new(DATA_DIR).join(filename);
+        let fits_path = data_dir.join(filename);
         let frame_path = frame_dir.join(format!("frame_{:05}.png", index));
         let semaphore = Arc::clone(&semaphore);
         let clahe = Arc::clone(&clahe);
@@ -822,7 +885,7 @@ async fn main() {
 
     let url = format!(
         "{}/{}/{:02}/{:02}/",
-        BASE_URL, args.year, args.month, args.day
+        args.base_url, args.year, args.month, args.day
     );
     println!("Fetching data from: {}", url);
 
@@ -837,27 +900,61 @@ async fn main() {
                 match response.bytes().await {
                     Ok(bytes) => {
                         let html = String::from_utf8_lossy(&bytes);
-                        let fits_files = extract_hrieuv174_fits_files(&html);
-                        println!("Found {} FITS files", fits_files.len());
+                        let all_fits_files = extract_fits_files(&html);
 
-                        if let Err(error) = download_hrieuv174_fits_files(&url, &fits_files).await {
-                            eprintln!("Error downloading files: {}", error);
+                        if all_fits_files.is_empty() {
+                            eprintln!("No FITS files found for this date.");
                             return;
                         }
 
-                        if let Err(error) = ensure_all_files_are_present(&fits_files).await {
-                            eprintln!("Data verification failed: {}", error);
+                        let groups = group_fits_files(&all_fits_files);
+
+                        let selected_indices = match prompt_group_selection(&groups).await {
+                            Ok(indices) => indices,
+                            Err(e) => {
+                                eprintln!("Error reading selection: {}", e);
+                                return;
+                            }
+                        };
+
+                        if selected_indices.is_empty() {
+                            println!("No datasets selected. Exiting.");
                             return;
                         }
 
-                        let video_name =
-                            format!("{}-{:02}-{:02}.mp4", args.year, args.month, args.day);
-                        let video_path = PathBuf::from(DATA_DIR).join(video_name);
+                        for &idx in &selected_indices {
+                            let (group_name, files) = &groups[idx];
+                            let data_dir = Path::new(DATA_DIR).join(group_name);
 
-                        if let Err(error) =
-                            generate_video_from_fits_files(&fits_files, &video_path).await
-                        {
-                            eprintln!("Error generating video: {}", error);
+                            println!(
+                                "\n--- Processing group: {} ({} files) ---",
+                                group_name,
+                                files.len()
+                            );
+
+                            if let Err(error) = download_fits_files(&url, files, &data_dir).await {
+                                eprintln!("Error downloading files: {}", error);
+                                continue;
+                            }
+
+                            if let Err(error) =
+                                ensure_all_files_are_present(files, &data_dir).await
+                            {
+                                eprintln!("Data verification failed: {}", error);
+                                continue;
+                            }
+
+                            let video_name = format!(
+                                "{}-{:02}-{:02}.mp4",
+                                args.year, args.month, args.day
+                            );
+                            let video_path = data_dir.join(video_name);
+
+                            if let Err(error) =
+                                generate_video_from_fits_files(files, &video_path, &data_dir).await
+                            {
+                                eprintln!("Error generating video: {}", error);
+                            }
                         }
                     }
                     Err(e) => eprintln!("Error reading response bytes: {}", e),
