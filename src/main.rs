@@ -2,13 +2,7 @@ use clap::Parser;
 use fitsio::{FitsFile, hdu::HduInfo};
 use image::GrayImage;
 use reqwest::Client;
-use std::{
-    collections::BTreeMap,
-    error::Error,
-    io::Write,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, error::Error, io::Write, path::Path, sync::Arc};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -17,7 +11,7 @@ use tokio::{
     task::{JoinSet, spawn_blocking},
 };
 
-const BASE_URL: &str = "https://www.sidc.be/EUI/data/L1";
+const BASE_URL: &str = "https://www.sidc.be/EUI/data/L2";
 const DATA_DIR: &str = "data";
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
@@ -169,6 +163,10 @@ struct Args {
     year: u16,
     #[arg(short = 'b', long, default_value = BASE_URL)]
     base_url: String,
+    /// Apply unsharp masking after CLAHE.  Pass alone for the default strength
+    /// of 1.0 (`--unsharp`), or with a value to tune it (`--unsharp 0.5`).
+    #[arg(long, default_missing_value = "1.0", num_args = 0..=1, require_equals = false)]
+    unsharp: Option<f32>,
 }
 
 fn strip_timestamp_version(filename: &str) -> &str {
@@ -474,13 +472,16 @@ async fn prompt_group_selection(groups: &[(String, Vec<String>)]) -> Result<Vec<
     Ok(indices)
 }
 
-async fn ensure_all_files_are_present(filenames: &[String], data_dir: &Path) -> Result<(), DynError> {
+async fn ensure_all_files_are_present(
+    filenames: &[String],
+    data_dir: &Path,
+) -> Result<(), DynError> {
     let mut missing_files = Vec::new();
 
     for filename in filenames {
         let output_path = data_dir.join(filename);
         if !fs::try_exists(&output_path).await? {
-            missing_files.push(filename.clone());
+            missing_files.push(filename.clone())
         }
     }
 
@@ -501,11 +502,74 @@ async fn ensure_all_files_are_present(filenames: &[String], data_dir: &Path) -> 
         .into())
     }
 }
+/// Build a 1-D Gaussian kernel with the given sigma.
+fn gaussian_kernel(sigma: f32) -> Vec<f32> {
+    let radius = (3.0 * sigma).ceil() as usize;
+    let mut kernel: Vec<f32> = (0..=2 * radius)
+        .map(|i| {
+            let x = i as f32 - radius as f32;
+            (-x * x / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let sum: f32 = kernel.iter().sum();
+    kernel.iter_mut().for_each(|k| *k /= sum);
+    kernel
+}
+
+/// Separable Gaussian blur (horizontal pass then vertical pass).
+fn gaussian_blur(src: &[u8], width: u32, height: u32, sigma: f32) -> Vec<u8> {
+    let kernel = gaussian_kernel(sigma);
+    let radius = kernel.len() / 2;
+    let w = width as usize;
+    let h = height as usize;
+
+    // Horizontal pass → f32 scratch buffer.
+    let mut tmp = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sx =
+                    (x as isize + ki as isize - radius as isize).clamp(0, w as isize - 1) as usize;
+                acc += src[y * w + sx] as f32 * kv;
+            }
+            tmp[y * w + x] = acc;
+        }
+    }
+
+    // Vertical pass → output bytes.
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sy =
+                    (y as isize + ki as isize - radius as isize).clamp(0, h as isize - 1) as usize;
+                acc += tmp[sy * w + x] * kv;
+            }
+            out[y * w + x] = acc.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Unsharp mask: `output = clamp(src + strength * (src - blurred), 0, 255)`.
+fn apply_unsharp_mask(src: &[u8], width: u32, height: u32, strength: f32) -> Vec<u8> {
+    let blurred = gaussian_blur(src, width, height, 2.0);
+    src.iter()
+        .zip(blurred.iter())
+        .map(|(&orig, &blur)| {
+            let v = orig as f32 + strength * (orig as f32 - blur as f32);
+            v.round().clamp(0.0, 255.0) as u8
+        })
+        .collect()
+}
 
 async fn generate_video_from_fits_files(
     filenames: &[String],
     output_path: &Path,
     data_dir: &Path,
+    unsharp_strength: Option<f32>,
 ) -> Result<(), DynError> {
     let frame_dir = output_path.with_extension("");
     if fs::try_exists(&frame_dir).await? {
@@ -531,8 +595,21 @@ async fn generate_video_from_fits_files(
         CLAHE_CLIP_LIMIT
     ));
 
+    if let Some(s) = unsharp_strength {
+        log_step(&format!(
+            "Unsharp masking enabled (strength {s:.2}, sigma 2.0 px)"
+        ));
+    }
     log_step("Converting FITS files to PNG frames...");
-    convert_fits_files_to_png_frames(filenames, &frame_dir, mapping, clahe, data_dir).await?;
+    convert_fits_files_to_png_frames(
+        filenames,
+        &frame_dir,
+        mapping,
+        clahe,
+        data_dir,
+        unsharp_strength,
+    )
+    .await?;
 
     log_step("All frames processed, generating video...");
 
@@ -772,6 +849,7 @@ async fn convert_fits_files_to_png_frames(
     mapping: AsinhMapping,
     clahe: Arc<ClaheLut>,
     data_dir: &Path,
+    unsharp_strength: Option<f32>,
 ) -> Result<(), DynError> {
     let concurrency = processing_concurrency();
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -790,9 +868,11 @@ async fn convert_fits_files_to_png_frames(
                 .await
                 .map_err(|error| -> DynError { Box::new(error) })?;
 
-            spawn_blocking(move || fits_to_png_frame(&fits_path, &frame_path, mapping, &clahe))
-                .await
-                .map_err(|error| -> DynError { Box::new(error) })?
+            spawn_blocking(move || {
+                fits_to_png_frame(&fits_path, &frame_path, mapping, &clahe, unsharp_strength)
+            })
+            .await
+            .map_err(|error| -> DynError { Box::new(error) })?
         });
     }
 
@@ -837,6 +917,7 @@ fn fits_to_png_frame(
     png_path: &Path,
     mapping: AsinhMapping,
     clahe: &ClaheLut,
+    unsharp_strength: Option<f32>,
 ) -> Result<(), DynError> {
     let mut fits_file = FitsFile::open(fits_path)?;
     let (hdu_index, shape) = find_image_hdu(&mut fits_file)?;
@@ -865,6 +946,11 @@ fn fits_to_png_frame(
             clahe.apply(x, y, bin)
         })
         .collect();
+
+    let bytes = match unsharp_strength {
+        Some(strength) => apply_unsharp_mask(&bytes, width, height, strength),
+        None => bytes,
+    };
 
     let image = GrayImage::from_raw(width, height, bytes).ok_or_else(|| {
         format!(
@@ -937,21 +1023,23 @@ async fn main() {
                                 continue;
                             }
 
-                            if let Err(error) =
-                                ensure_all_files_are_present(files, &data_dir).await
+                            if let Err(error) = ensure_all_files_are_present(files, &data_dir).await
                             {
                                 eprintln!("Data verification failed: {}", error);
                                 continue;
                             }
 
-                            let video_name = format!(
-                                "{}-{:02}-{:02}.mp4",
-                                args.year, args.month, args.day
-                            );
+                            let video_name =
+                                format!("{}-{:02}-{:02}.mp4", args.year, args.month, args.day);
                             let video_path = data_dir.join(video_name);
 
-                            if let Err(error) =
-                                generate_video_from_fits_files(files, &video_path, &data_dir).await
+                            if let Err(error) = generate_video_from_fits_files(
+                                files,
+                                &video_path,
+                                &data_dir,
+                                args.unsharp,
+                            )
+                            .await
                             {
                                 eprintln!("Error generating video: {}", error);
                             }
