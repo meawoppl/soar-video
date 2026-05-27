@@ -253,3 +253,17 @@ pub fn extract_fits_files(html: &str) -> Vec<String> {
         })
         .collect()
 }
+
+pub async fn fetch_directory_listing(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, DynError> {
+    let response = client.get(url).send().await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Failed to fetch data: HTTP {}", response.status()).into());
+    }
+
+    let bytes = response.bytes().await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}

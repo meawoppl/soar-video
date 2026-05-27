@@ -2,15 +2,14 @@ use clap::Parser;
 use std::path::Path;
 
 use crate::{
-    pipeline::{download::ensure_all_files_are_present, fits::group_fits_files},
-    util::processing_concurrency,
-};
-use crate::{
     pipeline::{
-        download::{download_fits_files, extract_fits_files, prompt_group_selection},
+        download::{
+            download_fits_files, extract_fits_files, fetch_directory_listing,
+            prompt_group_selection,
+        },
         fits::generate_video_from_fits_files,
     },
-    util::{BASE_URL, DATA_DIR},
+    util::{BASE_URL, DATA_DIR, DynError, build_url, processing_concurrency},
 };
 
 // import lib.rs
@@ -36,12 +35,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    if let Err(error) = run().await {
+        eprintln!("{error}");
+    }
+}
 
-    let url = format!(
-        "{}/{}/{:02}/{:02}/",
-        args.base_url, args.year, args.month, args.day
-    );
+async fn run() -> Result<(), DynError> {
+    let args = Args::parse();
+    let url = build_url(&args);
     println!("Fetching data from: {}", url);
 
     let client = reqwest::Client::builder()
@@ -49,77 +50,49 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
-    match client.get(&url).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.bytes().await {
-                    Ok(bytes) => {
-                        let html = String::from_utf8_lossy(&bytes);
-                        let all_fits_files = extract_fits_files(&html);
+    let html = fetch_directory_listing(&client, &url).await?;
+    let all_fits_files = extract_fits_files(&html);
 
-                        if all_fits_files.is_empty() {
-                            eprintln!("No FITS files found for this date.");
-                            return;
-                        }
-
-                        let groups = group_fits_files(&all_fits_files);
-
-                        let selected_indices = match prompt_group_selection(&groups).await {
-                            Ok(indices) => indices,
-                            Err(e) => {
-                                eprintln!("Error reading selection: {}", e);
-                                return;
-                            }
-                        };
-
-                        if selected_indices.is_empty() {
-                            println!("No datasets selected. Exiting.");
-                            return;
-                        }
-
-                        for &idx in &selected_indices {
-                            let (group_name, files) = &groups[idx];
-                            let data_dir = Path::new(DATA_DIR).join(group_name);
-
-                            println!(
-                                "\n--- Processing group: {} ({} files) ---",
-                                group_name,
-                                files.len()
-                            );
-
-                            if let Err(error) = download_fits_files(&url, files, &data_dir).await {
-                                eprintln!("Error downloading files: {}", error);
-                                continue;
-                            }
-
-                            if let Err(error) = ensure_all_files_are_present(files, &data_dir).await
-                            {
-                                eprintln!("Data verification failed: {}", error);
-                                continue;
-                            }
-
-                            let video_name =
-                                format!("{}-{:02}-{:02}.mp4", args.year, args.month, args.day);
-                            let video_path = data_dir.join(video_name);
-
-                            if let Err(error) = generate_video_from_fits_files(
-                                files,
-                                &video_path,
-                                &data_dir,
-                                args.unsharp,
-                            )
-                            .await
-                            {
-                                eprintln!("Error generating video: {}", error);
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("Error reading response bytes: {}", e),
-                }
-            } else {
-                eprintln!("Failed to fetch data: HTTP {}", response.status());
-            }
-        }
-        Err(e) => eprintln!("Error making request: {}", e),
+    if all_fits_files.is_empty() {
+        eprintln!("No FITS files found for this date.");
+        return Ok(());
     }
+
+    let groups = crate::pipeline::fits::group_fits_files(&all_fits_files);
+    let selected_indices = prompt_group_selection(&groups).await?;
+
+    if selected_indices.is_empty() {
+        println!("No datasets selected. Exiting.");
+        return Ok(());
+    }
+
+    for &idx in &selected_indices {
+        process_group(&args, &url, &groups[idx]).await?;
+    }
+
+    Ok(())
+}
+
+async fn process_group(
+    args: &Args,
+    url: &str,
+    group: &(String, Vec<String>),
+) -> Result<(), DynError> {
+    let (group_name, files) = group;
+    let data_dir = Path::new(DATA_DIR).join(group_name);
+
+    println!(
+        "\n--- Processing group: {} ({} files) ---",
+        group_name,
+        files.len()
+    );
+
+    download_fits_files(url, files, &data_dir).await?;
+    crate::pipeline::download::ensure_all_files_are_present(files, &data_dir).await?;
+
+    let video_name = format!("{}-{:02}-{:02}.mp4", args.year, args.month, args.day);
+    let video_path = data_dir.join(video_name);
+
+    generate_video_from_fits_files(files, &video_path, &data_dir, args.unsharp).await?;
+    Ok(())
 }

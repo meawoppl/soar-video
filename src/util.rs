@@ -1,5 +1,7 @@
 use std::{error::Error, io::Write};
 
+use crate::Args;
+
 pub const BASE_URL: &str = "https://www.sidc.be/EUI/data/L2";
 pub const DATA_DIR: &str = "data";
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 4;
@@ -23,4 +25,11 @@ pub fn processing_concurrency() -> usize {
 
 pub fn percentile_index(len: usize, percentile: f64) -> usize {
     (((len - 1) as f64 * percentile / 100.0).round() as usize).clamp(0, len - 1)
+}
+
+pub fn build_url(args: &Args) -> String {
+    format!(
+        "{}/{}/{:02}/{:02}/",
+        args.base_url, args.year, args.month, args.day
+    )
 }
