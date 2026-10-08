@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use fitsio::{FitsFile, hdu::HduInfo};
+use fitsio_pure::compat::{FitsFile, hdu::HduInfo};
 use tokio::{
     sync::Semaphore,
     task::{JoinSet, spawn_blocking},

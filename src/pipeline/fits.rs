@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use fitsio::FitsFile;
+use fitsio_pure::compat::FitsFile;
 use image::GrayImage;
 use tokio::{
     fs,

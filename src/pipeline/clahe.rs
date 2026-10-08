@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use fitsio::FitsFile;
+use fitsio_pure::compat::FitsFile;
 use tokio::{
     sync::Semaphore,
     task::{JoinSet, spawn_blocking},

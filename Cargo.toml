@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
+fitsio-pure = { version = "0.20.1", features = ["compat"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 reqwest = "0.13.3"
 tokio = { version = "1.52.1", features = ["full"] }
-fitsio = { version = "0.21", features = ["fitsio-src", "src-cmake"] }
