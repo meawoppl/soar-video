@@ -311,9 +311,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fitsio-pure"
-version = "0.21.6"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f37b39a2743725c95cae37051cac3edbefaa5877b3a8150fb0e187d732d78fcd"
+checksum = "9c4007a663fdc7f822cbe96e04d0c7ed762e1d7b85885ca238746807272f44ed"
 dependencies = [
  "bytemuck",
  "libm",
